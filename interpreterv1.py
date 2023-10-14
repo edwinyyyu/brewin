@@ -47,7 +47,7 @@ class Interpreter(InterpreterBase):
                 )
             case "inputi":
                 if len(args) == 1:
-                    self.output(args[0])
+                    self.output(self.evaluate_expression(args[0]).get("val"))
                 elif len(args) > 1:
                     self.error(
                         ErrorType.NAME_ERROR,
