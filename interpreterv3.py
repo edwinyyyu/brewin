@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from brewparse import parse_program
 from element import Element
 from intbase import InterpreterBase, ErrorType
@@ -98,7 +100,7 @@ class Interpreter(InterpreterBase):
     def run_return(self, statement):
         expression = statement.get("expression")
         if expression:
-            raise Return(self.evaluate_expression(expression))
+            raise Return(deepcopy(self.evaluate_expression(expression)))
         else:
             raise Return(Element("nil"))
 
@@ -110,28 +112,20 @@ class Interpreter(InterpreterBase):
             function_def = self.function_defs[name][len(args)]
             params = function_def.get("args")
             statements = function_def.get("statements")
+        elif name in self.variables:
+            function_def = self.variables[name][-1]
+            params = function_def.get("args")
+            statements = function_def.get("statements")
 
-            for param, arg in zip(params, args):
-                param_name = param.get("name")
-                self.variables.setdefault(param_name, [])
-                self.variables[param_name].append(self.evaluate_expression(arg))
-
-            self.create_scope()
-            try:
-                for statement in statements:
-                    self.run_statement(statement)
-                return Element("nil")
-            except Return as ret:
-                return ret.value
-            finally:
-                self.delete_scope()
-
-                for param in params:
-                    param_name = param.get("name")
-                    self.variables[param_name].pop()
-
-                    if not self.variables[param_name]:
-                        del self.variables[param_name]
+            if function_def.elem_type not in {"func", "lambda"}:
+                self.error(
+                    ErrorType.TYPE_ERROR, f"Variable {name} does not hold a function"
+                )
+            if len(params) != len(args):
+                self.error(
+                    ErrorType.TYPE_ERROR,
+                    f"{name} takes {len(params)} parameters: {len(args)} arguments given",
+                )
         elif name in self.builtin_functions:
             return self.run_builtin(function)
         else:
@@ -139,6 +133,44 @@ class Interpreter(InterpreterBase):
                 ErrorType.NAME_ERROR,
                 f"No {name}() function found that takes {len(args)} parameters",
             )
+
+        if function_def.elem_type == "lambda":
+            captures = function_def.get("captures")
+            for capture_name, capture_value in captures.items():
+                self.variables.setdefault(capture_name, [])
+                self.variables[capture_name].append(capture_value)
+
+        for param, arg in zip(params, args):
+            param_name = param.get("name")
+            self.variables.setdefault(param_name, [])
+            self.variables[param_name].append(self.evaluate_expression(arg))
+
+        self.create_scope()
+        try:
+            for statement in statements:
+                self.run_statement(statement)
+            return Element("nil")
+        except Return as ret:
+            return ret.value
+        finally:
+            self.delete_scope()
+
+            for param, arg in zip(params, args):
+                param_name = param.get("name")
+                final_value = self.variables[param_name].pop()
+
+                if param.elem_type == "refarg" and arg.elem_type == "var":
+                    self.variables[arg.get("name")][-1] = final_value
+
+                if not self.variables[param_name]:
+                    del self.variables[param_name]
+
+            if function_def.elem_type == "lambda":
+                for capture_name in captures:
+                    captures[capture_name] = self.variables[capture_name].pop()
+
+                    if not self.variables[capture_name]:
+                        del self.variables[capture_name]
 
     def run_builtin(self, function):
         name = function.get("name")
@@ -213,10 +245,28 @@ class Interpreter(InterpreterBase):
                 return self.evaluate_binary_operation(expression)
             case "fcall":
                 return self.run_function(expression)
-            case "var":
+            case "lambda":
+                captures = deepcopy(
+                    {name: values[-1] for name, values in self.variables.items()}
+                )
+                return Element(
+                    "lambda",
+                    args=expression.get("args"),
+                    statements=expression.get("statements"),
+                    captures=captures,
+                )
+            case "var":  # Includes bound lambdas and named functions
                 name = expression.get("name")
                 if name in self.variables:
                     return self.variables[name][-1]
+                elif name in self.function_defs:
+                    if len(self.function_defs[name]) != 1:
+                        self.error(
+                            ErrorType.NAME_ERROR,
+                            f"Assignment to {name}() function is ambiguous",
+                        )
+
+                    return next(iter(self.function_defs[name].values()))
                 else:
                     self.error(
                         ErrorType.NAME_ERROR, f"Variable {name} has not been defined"
@@ -273,9 +323,10 @@ class Interpreter(InterpreterBase):
                     else:
                         raise TypeError
                 case "==":
-                    if (op1.elem_type == "int" and op2.elem_type == "bool") or (
-                        op1.elem_type == "bool" and op2.elem_type == "int"
-                    ):
+                    if (op1.elem_type, op2.elem_type) in {
+                        ("int", "bool"),
+                        ("bool", "int"),
+                    }:
                         op1 = self.to_bool(op1)
                         op2 = self.to_bool(op2)
                         return self.evaluate_binary_operation(
@@ -283,12 +334,15 @@ class Interpreter(InterpreterBase):
                         )
                     elif op1.elem_type != op2.elem_type:
                         return Element("bool", val=False)
+                    elif op1.elem_type == "func" or op1.elem_type == "lambda":
+                        return Element("bool", val=op1 is op2)
                     else:
                         return Element("bool", val=op1.get("val") == op2.get("val"))
                 case "!=":
-                    if (op1.elem_type == "int" and op2.elem_type == "bool") or (
-                        op1.elem_type == "bool" and op2.elem_type == "int"
-                    ):
+                    if (op1.elem_type, op2.elem_type) in {
+                        ("int", "bool"),
+                        ("bool", "int"),
+                    }:
                         op1 = self.to_bool(op1)
                         op2 = self.to_bool(op2)
                         return self.evaluate_binary_operation(
@@ -296,6 +350,8 @@ class Interpreter(InterpreterBase):
                         )
                     elif op1.elem_type != op2.elem_type:
                         return Element("bool", val=True)
+                    elif op1.elem_type == "func" or op1.elem_type == "lambda":
+                        return Element("bool", val=op1 is not op2)
                     else:
                         return Element("bool", val=op1.get("val") != op2.get("val"))
                 case "<":
