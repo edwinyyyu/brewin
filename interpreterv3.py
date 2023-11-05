@@ -5,6 +5,12 @@ from element import Element
 from intbase import InterpreterBase, ErrorType
 
 
+class Variable:
+    def __init__(self, element):
+        super().__init__()
+        self.element = element
+
+
 class Return(Exception):
     def __init__(self, value):
         super().__init__()
@@ -113,11 +119,11 @@ class Interpreter(InterpreterBase):
             params = function_def.get("args")
             statements = function_def.get("statements")
         elif name in self.variables:
-            function_def = self.variables[name][-1]
+            function_def = self.variables[name][-1].element
             params = function_def.get("args")
             statements = function_def.get("statements")
 
-            if function_def.elem_type not in {"func", "lambda"}:
+            if function_def.elem_type not in {"func", "closure"}:
                 self.error(
                     ErrorType.TYPE_ERROR, f"Variable {name} does not hold a function"
                 )
@@ -134,16 +140,31 @@ class Interpreter(InterpreterBase):
                 f"No {name}() function found that takes {len(args)} parameters",
             )
 
-        if function_def.elem_type == "lambda":
+        param_names = {param.get("name") for param in params}
+        arg_names = {arg.get("name") for arg in args}
+        silenced_capture_names = param_names.union(arg_names)
+
+        if function_def.elem_type == "closure":
             captures = function_def.get("captures")
             for capture_name, capture_value in captures.items():
-                self.variables.setdefault(capture_name, [])
-                self.variables[capture_name].append(capture_value)
+                if capture_name not in silenced_capture_names:
+                    self.variables.setdefault(capture_name, [])
+                    self.variables[capture_name].append(Variable(capture_value))
 
+        # Get argument values before shadowing
+        arg_values = []
         for param, arg in zip(params, args):
             param_name = param.get("name")
+            arg_name = arg.get("name")
+            if param.elem_type == "refarg" and arg_name in self.variables:
+                arg_values.append(self.variables[arg_name][-1])
+            else:
+                arg_values.append(Variable(deepcopy(self.evaluate_expression(arg))))
+
+        for param, arg_value in zip(params, arg_values):
+            param_name = param.get("name")
             self.variables.setdefault(param_name, [])
-            self.variables[param_name].append(self.evaluate_expression(arg))
+            self.variables[param_name].append(arg_value)
 
         self.create_scope()
         try:
@@ -155,22 +176,22 @@ class Interpreter(InterpreterBase):
         finally:
             self.delete_scope()
 
-            for param, arg in zip(params, args):
+            for param in params:
                 param_name = param.get("name")
-                final_value = self.variables[param_name].pop()
-
-                if param.elem_type == "refarg" and arg.elem_type == "var":
-                    self.variables[arg.get("name")][-1] = final_value
+                self.variables[param_name].pop()
 
                 if not self.variables[param_name]:
                     del self.variables[param_name]
 
-            if function_def.elem_type == "lambda":
+            if function_def.elem_type == "closure":
                 for capture_name in captures:
-                    captures[capture_name] = self.variables[capture_name].pop()
+                    if capture_name not in silenced_capture_names:
+                        captures[capture_name] = (
+                            self.variables[capture_name].pop().element
+                        )
 
-                    if not self.variables[capture_name]:
-                        del self.variables[capture_name]
+                        if not self.variables[capture_name]:
+                            del self.variables[capture_name]
 
     def run_builtin(self, function):
         name = function.get("name")
@@ -233,9 +254,29 @@ class Interpreter(InterpreterBase):
 
         if name not in self.variables:
             self.scopes[-1].append(name)
-            self.variables[name] = [self.evaluate_expression(expression)]
+            if expression.elem_type != "var":
+                self.variables[name] = [Variable(self.evaluate_expression(expression))]
+            else:
+                existing_name = expression.get("name")
+                if existing_name in self.variables:
+                    self.variables[name] = [self.variables[existing_name][-1]]
+                elif existing_name in self.function_defs:
+                    if len(self.function_defs[existing_name]) != 1:
+                        self.error(
+                            ErrorType.NAME_ERROR,
+                            f"Assignment to {existing_name}() function is ambiguous",
+                        )
+
+                    self.variables[name] = [
+                        Variable(next(iter(self.function_defs[existing_name].values())))
+                    ]
+                else:
+                    self.error(
+                        ErrorType.NAME_ERROR,
+                        f"Variable {existing_name} has not been defined",
+                    )
         else:
-            self.variables[name][-1] = self.evaluate_expression(expression)
+            self.variables[name][-1].element = self.evaluate_expression(expression)
 
     def evaluate_expression(self, expression):
         match expression.elem_type:
@@ -247,23 +288,26 @@ class Interpreter(InterpreterBase):
                 return self.run_function(expression)
             case "lambda":
                 captures = deepcopy(
-                    {name: values[-1] for name, values in self.variables.items()}
+                    {
+                        name: values[-1].element
+                        for name, values in self.variables.items()
+                    }
                 )
                 return Element(
-                    "lambda",
+                    "closure",
                     args=expression.get("args"),
                     statements=expression.get("statements"),
                     captures=captures,
                 )
-            case "var":  # Includes bound lambdas and named functions
+            case "var":  # Includes named functions and bound lambdas
                 name = expression.get("name")
                 if name in self.variables:
-                    return self.variables[name][-1]
+                    return self.variables[name][-1].element
                 elif name in self.function_defs:
                     if len(self.function_defs[name]) != 1:
                         self.error(
                             ErrorType.NAME_ERROR,
-                            f"Assignment to {name}() function is ambiguous",
+                            f"{name}() function is ambiguous",
                         )
 
                     return next(iter(self.function_defs[name].values()))
@@ -271,7 +315,7 @@ class Interpreter(InterpreterBase):
                     self.error(
                         ErrorType.NAME_ERROR, f"Variable {name} has not been defined"
                     )
-            case "int" | "string" | "bool" | "nil":
+            case "int" | "string" | "bool" | "nil" | "func" | "closure":
                 return expression
 
     def evaluate_unary_operation(self, operation):
@@ -308,21 +352,23 @@ class Interpreter(InterpreterBase):
                     op2 = self.to_int(op2)
                     return Element("int", val=op1.get("val") + op2.get("val"))
                 case "-":
-                    if op1.elem_type == op2.elem_type == "int":
-                        return Element("int", val=op1.get("val") - op2.get("val"))
-                    else:
-                        raise TypeError
+                    op1 = self.to_int(op1)
+                    op2 = self.to_int(op2)
+                    return Element("int", val=op1.get("val") - op2.get("val"))
                 case "*":
-                    if op1.elem_type == op2.elem_type == "int":
-                        return Element("int", val=op1.get("val") * op2.get("val"))
-                    else:
-                        raise TypeError
+                    op1 = self.to_int(op1)
+                    op2 = self.to_int(op2)
+                    return Element("int", val=op1.get("val") * op2.get("val"))
                 case "/":
-                    if op1.elem_type == op2.elem_type == "int":
-                        return Element("int", val=op1.get("val") // op2.get("val"))
-                    else:
-                        raise TypeError
+                    op1 = self.to_int(op1)
+                    op2 = self.to_int(op2)
+                    return Element("int", val=op1.get("val") // op2.get("val"))
                 case "==":
+                    # TODO: EWW
+                    if op1.elem_type == "int" and op2.elem_type == "int":
+                        if op1.get("val") != 0 and op2.get("val") != 0:
+                            return Element("bool", val=True)
+
                     if (op1.elem_type, op2.elem_type) in {
                         ("int", "bool"),
                         ("bool", "int"),
@@ -334,7 +380,7 @@ class Interpreter(InterpreterBase):
                         )
                     elif op1.elem_type != op2.elem_type:
                         return Element("bool", val=False)
-                    elif op1.elem_type == "func" or op1.elem_type == "lambda":
+                    elif op1.elem_type == "func" or op1.elem_type == "closure":
                         return Element("bool", val=op1 is op2)
                     else:
                         return Element("bool", val=op1.get("val") == op2.get("val"))
@@ -350,7 +396,7 @@ class Interpreter(InterpreterBase):
                         )
                     elif op1.elem_type != op2.elem_type:
                         return Element("bool", val=True)
-                    elif op1.elem_type == "func" or op1.elem_type == "lambda":
+                    elif op1.elem_type == "func" or op1.elem_type == "closure":
                         return Element("bool", val=op1 is not op2)
                     else:
                         return Element("bool", val=op1.get("val") != op2.get("val"))
