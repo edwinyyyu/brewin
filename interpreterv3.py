@@ -364,11 +364,6 @@ class Interpreter(InterpreterBase):
                     op2 = self.to_int(op2)
                     return Element("int", val=op1.get("val") // op2.get("val"))
                 case "==":
-                    # TODO: EWW
-                    if op1.elem_type == "int" and op2.elem_type == "int":
-                        if op1.get("val") != 0 and op2.get("val") != 0:
-                            return Element("bool", val=True)
-
                     if (op1.elem_type, op2.elem_type) in {
                         ("int", "bool"),
                         ("bool", "int"),
