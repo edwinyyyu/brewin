@@ -30,7 +30,6 @@ class Interpreter(InterpreterBase):
 
     def run(self, program):
         program_node = parse_program(program)
-
         functions = program_node.get("functions")
         for function in functions:
             name = function.get("name")
@@ -55,19 +54,26 @@ class Interpreter(InterpreterBase):
                 self.run_assignment(statement)
 
     def create_scope(self):
-        self.scopes.append([])
+        self.scopes.append(set())
 
     def delete_scope(self):
         for variable_name in self.scopes[-1]:
-            self.variables[variable_name].pop()
-            if not self.variables[variable_name]:
-                del self.variables[variable_name]
+            self.pop_variable(variable_name)
         self.scopes.pop()
+
+    def push_variable(self, variable_name, variable):
+        self.scopes[-1].add(variable_name)
+        self.variables.setdefault(variable_name, [])
+        self.variables[variable_name].append(variable)
+
+    def pop_variable(self, variable_name):
+        self.variables[variable_name].pop()
+        if not self.variables[variable_name]:
+            del self.variables[variable_name]
 
     def run_if(self, if_block):
         statements = if_block.get("statements")
         else_statements = if_block.get("else_statements")
-
         self.create_scope()
         try:
             condition = self.to_bool(if_block.get("condition"))
@@ -86,7 +92,6 @@ class Interpreter(InterpreterBase):
 
     def run_while(self, while_block):
         statements = while_block.get("statements")
-
         self.create_scope()
         try:
             while True:
@@ -113,7 +118,6 @@ class Interpreter(InterpreterBase):
     def run_function(self, function):
         name = function.get("name")
         args = function.get("args")
-
         if name in self.function_defs and len(args) in self.function_defs[name]:
             function_def = self.function_defs[name][len(args)]
             params = function_def.get("args")
@@ -141,32 +145,30 @@ class Interpreter(InterpreterBase):
             )
 
         param_names = {param.get("name") for param in params}
-        arg_names = {arg.get("name") for arg in args}
-        silenced_capture_names = param_names.union(arg_names)
 
-        if function_def.elem_type == "closure":
-            captures = function_def.get("captures")
-            for capture_name, capture_value in captures.items():
-                if capture_name not in silenced_capture_names:
-                    self.variables.setdefault(capture_name, [])
-                    self.variables[capture_name].append(Variable(capture_value))
-
-        # Get argument values before shadowing
-        arg_values = []
+        # Get arguments before shadowing
+        arg_variables = []
         for param, arg in zip(params, args):
             param_name = param.get("name")
             arg_name = arg.get("name")
             if param.elem_type == "refarg" and arg_name in self.variables:
-                arg_values.append(self.variables[arg_name][-1])
+                arg_variables.append(self.variables[arg_name][-1])
             else:
-                arg_values.append(Variable(deepcopy(self.evaluate_expression(arg))))
-
-        for param, arg_value in zip(params, arg_values):
-            param_name = param.get("name")
-            self.variables.setdefault(param_name, [])
-            self.variables[param_name].append(arg_value)
+                arg_variables.append(Variable(deepcopy(self.evaluate_expression(arg))))
 
         self.create_scope()
+        if function_def.elem_type == "closure":
+            captures = function_def.get("captures")
+            exposed_captures = dict(
+                filter(lambda capture: capture[0] not in param_names, captures.items())
+            )
+            for capture_name, capture_value in exposed_captures.items():
+                self.push_variable(capture_name, Variable(capture_value))
+
+        for param, arg_variable in zip(params, arg_variables):
+            param_name = param.get("name")
+            self.push_variable(param_name, arg_variable)
+
         try:
             for statement in statements:
                 self.run_statement(statement)
@@ -174,29 +176,15 @@ class Interpreter(InterpreterBase):
         except Return as ret:
             return ret.value
         finally:
-            self.delete_scope()
-
-            for param in params:
-                param_name = param.get("name")
-                self.variables[param_name].pop()
-
-                if not self.variables[param_name]:
-                    del self.variables[param_name]
-
             if function_def.elem_type == "closure":
-                for capture_name in captures:
-                    if capture_name not in silenced_capture_names:
-                        captures[capture_name] = (
-                            self.variables[capture_name].pop().element
-                        )
+                for capture_name in exposed_captures:
+                    captures[capture_name] = self.variables[capture_name][-1].element
 
-                        if not self.variables[capture_name]:
-                            del self.variables[capture_name]
+            self.delete_scope()
 
     def run_builtin(self, function):
         name = function.get("name")
         args = function.get("args")
-
         match name:
             case "print":
                 self.output("".join(self.fmt(arg) for arg in args))
@@ -249,34 +237,16 @@ class Interpreter(InterpreterBase):
                 raise TypeError
 
     def run_assignment(self, assignment):
-        name = assignment.get("name")
+        variable_name = assignment.get("name")
         expression = assignment.get("expression")
-
-        if name not in self.variables:
-            self.scopes[-1].append(name)
-            if expression.elem_type != "var":
-                self.variables[name] = [Variable(self.evaluate_expression(expression))]
-            else:
-                existing_name = expression.get("name")
-                if existing_name in self.variables:
-                    self.variables[name] = [self.variables[existing_name][-1]]
-                elif existing_name in self.function_defs:
-                    if len(self.function_defs[existing_name]) != 1:
-                        self.error(
-                            ErrorType.NAME_ERROR,
-                            f"Assignment to {existing_name}() function is ambiguous",
-                        )
-
-                    self.variables[name] = [
-                        Variable(next(iter(self.function_defs[existing_name].values())))
-                    ]
-                else:
-                    self.error(
-                        ErrorType.NAME_ERROR,
-                        f"Variable {existing_name} has not been defined",
-                    )
+        if variable_name not in self.variables:
+            self.push_variable(
+                variable_name, Variable(self.evaluate_expression(expression))
+            )
         else:
-            self.variables[name][-1].element = self.evaluate_expression(expression)
+            self.variables[variable_name][-1].element = self.evaluate_expression(
+                expression
+            )
 
     def evaluate_expression(self, expression):
         match expression.elem_type:
@@ -306,10 +276,8 @@ class Interpreter(InterpreterBase):
                 elif name in self.function_defs:
                     if len(self.function_defs[name]) != 1:
                         self.error(
-                            ErrorType.NAME_ERROR,
-                            f"{name}() function is ambiguous",
+                            ErrorType.NAME_ERROR, f"{name}() function is ambiguous"
                         )
-
                     return next(iter(self.function_defs[name].values()))
                 else:
                     self.error(
@@ -320,7 +288,6 @@ class Interpreter(InterpreterBase):
 
     def evaluate_unary_operation(self, operation):
         op1 = self.evaluate_expression(operation.get("op1"))
-
         try:
             match operation.elem_type:
                 case "neg":
@@ -341,13 +308,11 @@ class Interpreter(InterpreterBase):
         # Strict evaluation
         op1 = self.evaluate_expression(operation.get("op1"))
         op2 = self.evaluate_expression(operation.get("op2"))
-
         try:
             match operation.elem_type:
                 case "+":
                     if op1.elem_type == op2.elem_type == "string":
                         return Element("string", val=op1.get("val") + op2.get("val"))
-
                     op1 = self.to_int(op1)
                     op2 = self.to_int(op2)
                     return Element("int", val=op1.get("val") + op2.get("val"))
