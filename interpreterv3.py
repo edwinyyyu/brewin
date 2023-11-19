@@ -153,6 +153,8 @@ class Interpreter(InterpreterBase):
             arg_name = arg.get("name")
             if param.elem_type == "refarg" and arg_name in self.variables:
                 arg_variables.append(self.variables[arg_name][-1])
+            elif param.elem_type == "refarg" and arg_name in self.function_defs:
+                arg_variables.append(Variable(self.evaluate_expression(arg)))
             else:
                 arg_variables.append(Variable(deepcopy(self.evaluate_expression(arg))))
 
